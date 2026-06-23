@@ -783,12 +783,13 @@ static u32 find_pid(const char *name) {
 static void usage(const char *me) {
     printf(
         "\n"
-        "  kinject  --  kernel-level DLL injector (BYOVD)\n\n"
+        "  kinject  --  kernel-level DLL injector for Roblox (BYOVD)\n\n"
         "  usage:\n"
-        "    %s                                    PoC against Roblox\n"
-        "    %s <dll>                              inject into Roblox\n"
-        "    %s -n <name> <dll>                    inject by name\n"
+        "    %s                                    inject Module.dll into Roblox\n"
+        "    %s <dll>                              inject a specific DLL\n"
+        "    %s -n <name> <dll>                    inject by process name\n"
         "    %s -p <pid>  <dll>                    inject by PID\n\n"
+        "  default payload: Module.dll  (rename your DLL to Module.dll)\n"
         "  requires: Administrator + vulnerable signed driver\n\n",
         me, me, me, me);
 }
@@ -821,11 +822,10 @@ int main(int argc, char **argv) {
     }
 
     if (!dll) {
-        /* default: inject kernel32.dll as harmless PoC */
-        GetSystemDirectoryA(def, MAX_PATH);
-        strcat(def, "\\kernel32.dll");
+        /* default: Module.dll in the current directory */
+        GetFullPathNameA("Module.dll", MAX_PATH, def, 0);
         dll = def;
-        printf(" [!] no DLL specified, using %s as PoC\n", dll);
+        printf(" [*] payload: %s\n", dll);
     }
 
     /* --- bootstrap: get ntos base + our own cr3 --- */
