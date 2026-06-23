@@ -19,6 +19,7 @@ typedef unsigned char      u8;
 typedef unsigned short     u16;
 typedef unsigned int       u32;
 typedef unsigned long long u64;
+typedef int                i32;
 
 #define NT_SUCCESS(s)       ((NTSTATUS)(s) >= 0)
 
