@@ -1,20 +1,9 @@
-/*
- * kinject.c - Stable kernel-level DLL injector via BYOVD
- *
- * Leverages a vulnerable signed kernel driver to gain physical memory
- * read/write, then uses page-table walks with the target process CR3 to
- * inject a LoadLibraryA shellcode payload into any protected usermode
- * process (tested against Roblox/Hyperion).
- *
- * Build (x64 Native Tools Command Prompt for VS):
- *   cl /O2 /GS- kinject.c /Fe:kinject.exe /link ntdll.lib advapi32.lib
- *
- * Usage:
- *   kinject.exe
- *   kinject.exe C:\path\to\payload.dll
- *   kinject.exe -n RobloxPlayerBeta.exe C:\path\to\payload.dll
- *   kinject.exe -p 1234 C:\path\to\payload.dll
- */
+// kinject.c - kernel injector for roblox
+// uses a vulnerable signed driver to read/write physical memory directly
+// then walks page tables to inject shellcode that calls LoadLibraryA
+//
+// build:
+//   cl /O2 /GS- kinject.c /Fe:kinject.exe /link ntdll.lib advapi32.lib
 
 #include <windows.h>
 #include <stdio.h>
@@ -24,9 +13,7 @@
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "advapi32.lib")
 
-/* ------------------------------------------------------------------ */
-/* types                                                               */
-/* ------------------------------------------------------------------ */
+// shorthand types so we dont have to type unsigned long long everywhere
 typedef LONG               NTSTATUS;
 typedef unsigned char      u8;
 typedef unsigned short     u16;
@@ -34,95 +21,53 @@ typedef unsigned int       u32;
 typedef unsigned long long u64;
 
 #define NT_SUCCESS(s)       ((NTSTATUS)(s) >= 0)
-#define COUNTOF(a)          (sizeof(a) / sizeof(*(a)))
 
-/* ------------------------------------------------------------------ */
-/* known vulnerable driver device names                                */
-/* ------------------------------------------------------------------ */
+// all the known vulnerable driver device names we try to open
+// most of these ship with common hardware tools (msi afterburner, asus gpu tweak, etc.)
+// if you install then uninstall the app, the driver usually stays behind
 static const char *g_vuln_drivers[] = {
-    "\\\\.\\RTCore64",
-    "\\\\.\\GIO",
-    "\\\\.\\GLCKIO2",
-    "\\\\.\\Asusgio2",
-    "\\\\.\\Asusgio3",
-    "\\\\.\\iqvw64e",
-    "\\\\.\\Nal",
-    "\\\\.\\dbk64",
-    "\\\\.\\kprocesshacker",
-    "\\\\.\\WinRing0_1_2_0",
-    "\\\\.\\vrw",
-    "\\\\.\\atillk64",
-    "\\\\.\\Phymem",
-    "\\\\.\\MsIo64",
-    "\\\\.\\NTIOLib_X64",
-    "\\\\.\\RTCore32",
-    "\\\\.\\AODDriver",
-    "\\\\.\\AODDriver2",
-    "\\\\.\\AODDriver4.01",
-    "\\\\.\\AODDriver4.1",
-    "\\\\.\\AODDriver4.2",
-    "\\\\.\\AODDriver4.3",
-    "\\\\.\\ALSysIO",
-    "\\\\.\\Amifldrv64",
-    "\\\\.\\ASMMAP64",
-    "\\\\.\\cpuz137",
-    "\\\\.\\cpu139",
-    "\\\\.\\CoreTemp",
-    "\\\\.\\gdrv",
-    "\\\\.\\PassMark",
-    "\\\\.\\HwOs2_64",
-    "\\\\.\\HwOs2_32",
-    "\\\\.\\HDRW",
-    "\\\\.\\RTKIO64",
-    "\\\\.\\rwdrv",
-    "\\\\.\\mimidrv",
-    "\\\\.\\piddrv64",
-    "\\\\.\\WinIo",
-    "\\\\.\\WinRing0",
-    "\\\\.\\D2DDrv",
-    "\\\\.\\ICETool",
-    "\\\\.\\IOMap",
-    "\\\\.\\LGDCore",
-    "\\\\.\\LenovoDiagnosticsDriver",
-    "\\\\.\\ProcHelper",
-    "\\\\.\\PhyMemX64",
-    "\\\\.\\EneTechIo",
-    "\\\\.\\EneIo64",
-    "\\\\.\\Bioscore",
-    "\\\\.\\KProcessHacker3",
-    "\\\\.\\FlashSys",
+    "\\\\.\\RTCore64", "\\\\.\\GIO", "\\\\.\\GLCKIO2", "\\\\.\\Asusgio2",
+    "\\\\.\\Asusgio3", "\\\\.\\iqvw64e", "\\\\.\\Nal", "\\\\.\\dbk64",
+    "\\\\.\\kprocesshacker", "\\\\.\\WinRing0_1_2_0", "\\\\.\\vrw",
+    "\\\\.\\atillk64", "\\\\.\\Phymem", "\\\\.\\MsIo64", "\\\\.\\NTIOLib_X64",
+    "\\\\.\\RTCore32", "\\\\.\\AODDriver", "\\\\.\\AODDriver2",
+    "\\\\.\\AODDriver4.01", "\\\\.\\AODDriver4.1", "\\\\.\\AODDriver4.2",
+    "\\\\.\\AODDriver4.3", "\\\\.\\ALSysIO", "\\\\.\\Amifldrv64",
+    "\\\\.\\ASMMAP64", "\\\\.\\cpuz137", "\\\\.\\cpu139", "\\\\.\\CoreTemp",
+    "\\\\.\\gdrv", "\\\\.\\PassMark", "\\\\.\\HwOs2_64", "\\\\.\\HwOs2_32",
+    "\\\\.\\HDRW", "\\\\.\\RTKIO64", "\\\\.\\rwdrv", "\\\\.\\mimidrv",
+    "\\\\.\\piddrv64", "\\\\.\\WinIo", "\\\\.\\WinRing0", "\\\\.\\D2DDrv",
+    "\\\\.\\ICETool", "\\\\.\\IOMap", "\\\\.\\LGDCore",
+    "\\\\.\\LenovoDiagnosticsDriver", "\\\\.\\ProcHelper", "\\\\.\\PhyMemX64",
+    "\\\\.\\EneTechIo", "\\\\.\\EneIo64", "\\\\.\\Bioscore",
+    "\\\\.\\KProcessHacker3", "\\\\.\\FlashSys",
     NULL
 };
 
-/* ------------------------------------------------------------------ */
-/* Windows build table for EPROCESS offsets                           */
-/* ------------------------------------------------------------------ */
+// eprocess offsets change between windows builds, so we keep a lookup table
+// lo/hi are the build number range, off_pid/off_links/off_dirbase are the field offsets
 typedef struct {
     u32 lo, hi;
     u32 off_pid, off_links, off_dirbase;
 } off_t;
 
 static const off_t g_builds[] = {
-    { 10240, 10586,  0x2E8, 0x2F0, 0x28 },
-    { 14393, 16299,  0x2E0, 0x2E8, 0x28 },
-    { 17134, 22000,  0x440, 0x448, 0x28 },
-    { 22000, 26100,  0x440, 0x448, 0x28 },
-    { 26100, 99999,  0x440, 0x448, 0x28 },
+    { 10240, 10586,  0x2E8, 0x2F0, 0x28 },  // win10 1507-1511
+    { 14393, 16299,  0x2E0, 0x2E8, 0x28 },  // win10 1607-1709
+    { 17134, 22000,  0x440, 0x448, 0x28 },  // win10 1803 - win11 early
+    { 22000, 26100,  0x440, 0x448, 0x28 },  // win11 22h2
+    { 26100, 99999,  0x440, 0x448, 0x28 },  // win11 24h2+
     { 0, 0, 0, 0, 0 }
 };
 
-/* ------------------------------------------------------------------ */
-/* global state                                                        */
-/* ------------------------------------------------------------------ */
-static HANDLE  g_dev     = NULL;      /* driver device handle          */
-static u64     g_ntos    = 0;         /* ntoskrnl base (physical)      */
-static u64     g_ntos_va = 0;         /* ntoskrnl base (virtual)       */
-static off_t   g_off     = {0};       /* resolved eprocess offsets     */
-static u64     g_cr3     = 0;         /* bootstrap cr3 (self or sys)   */
+// global state - these get filled in during bootstrap and used everywhere
+static HANDLE  g_dev     = NULL;   // handle to the vulnerable driver
+static u64     g_ntos    = 0;      // ntoskrnl physical base
+static u64     g_ntos_va = 0;      // ntoskrnl virtual base
+static off_t   g_off     = {0};    // resolved eprocess offsets for this build
+static u64     g_cr3     = 0;      // our own cr3, used for kernel va->pa translation
 
-/* ================================================================== */
-/*  ntdll prototypes                                                   */
-/* ================================================================== */
+// ntdll function pointer for NtQuerySystemInformation
 typedef NTSTATUS (NTAPI *NtQSI_t)(
     u32 SystemInformationClass,
     void *SystemInformation,
@@ -130,6 +75,7 @@ typedef NTSTATUS (NTAPI *NtQSI_t)(
     u32 *ReturnLength
 );
 
+// partial SYSTEM_PROCESS_INFORMATION layout, just the fields we need to find the pid
 typedef struct {
     u32    NextEntryOffset;
     u32    NumberOfThreads;
@@ -161,24 +107,23 @@ typedef struct {
     u64    PagefileUsage;
     u64    PeakPagefileUsage;
     u64    PrivatePageCount;
-} spi_base_t;   /* matches SYSTEM_PROCESS_INFORMATION through PrivatePageCount */
+} spi_base_t;
 
-/* ================================================================== */
-/*  driver r/w primitives (RTCore64 / GIO compatible IOCTLs)          */
-/* ================================================================== */
-
+// the struct we pass to DeviceIoControl for the driver
+// a = physical address, b = buffer ptr, s = size
 typedef struct { u64 a, b; u32 s; } ioctl_req_t;
 
-/* try both widely-used IOCTL code pairs */
+// ---- low level: read physical memory through the driver ----
+// tries the RTCore64 ioctl first, falls back to GIO/ASUS style
 static BOOL phys_read(u64 pa, void *buf, u32 sz) {
     ioctl_req_t r = { pa, (u64)buf, sz };
     u32 rb = 0;
     if (DeviceIoControl(g_dev, 0x80002048, &r, sizeof(r), &r, sizeof(r), &rb, 0))
         return 1;
-    /* fallback: GIO / ASUS style */
     return DeviceIoControl(g_dev, 0xC3502800, &r, sizeof(r), &r, sizeof(r), &rb, 0);
 }
 
+// ---- low level: write physical memory through the driver ----
 static BOOL phys_write(u64 pa, const void *buf, u32 sz) {
     ioctl_req_t r = { pa, (u64)buf, sz };
     u32 rb = 0;
@@ -187,36 +132,37 @@ static BOOL phys_write(u64 pa, const void *buf, u32 sz) {
     return DeviceIoControl(g_dev, 0xC3502804, &r, sizeof(r), &r, sizeof(r), &rb, 0);
 }
 
-/* ================================================================== */
-/*  page-table walk: cr3 + va -> pa                                   */
-/* ================================================================== */
-
+// ---- walk x64 page tables to translate a virtual address to physical ----
+// cr3 = directory table base (from eprocess), va = virtual address, pa = out
+// handles both 4kb and 2mb/1gb large pages
 static int vtop(u64 cr3, u64 va, u64 *pa) {
     u64 off  = va & 0xFFF;
     u64 idx[4] = {
-        (va >> 39) & 0x1FF,
-        (va >> 30) & 0x1FF,
-        (va >> 21) & 0x1FF,
-        (va >> 12) & 0x1FF
+        (va >> 39) & 0x1FF,   // pml4 index
+        (va >> 30) & 0x1FF,   // pdpt index
+        (va >> 21) & 0x1FF,   // pd index
+        (va >> 12) & 0x1FF    // pt index
     };
-    u64 tbl = cr3 & ~0xFFFULL;
+    u64 tbl = cr3 & ~0xFFFULL;   // pml4 physical address (strip flags)
     for (int lv = 0; lv < 4; lv++) {
         u64 ent = 0;
         if (!phys_read(tbl + idx[lv] * 8, &ent, 8)) return 0;
-        if (!(ent & 1)) return 0;
+        if (!(ent & 1)) return 0;   // page not present
+
+        // bit 7 = large page at pdpt (1gb) or pd (2mb) level
         if (lv >= 1 && (ent & 0x80)) {
             u64 m = (lv == 1) ? 0xFFFFFC0000000ULL : 0xFFFFFFFE00000ULL;
             u64 o = (lv == 1) ? 0x3FFFFFFFULL : 0x1FFFFFULL;
             *pa = (ent & m) + (va & o);
             return 1;
         }
-        tbl = ent & ~0xFFFULL;
+        tbl = ent & ~0xFFFULL;   // next table level
     }
-    *pa = tbl + off;
+    *pa = tbl + off;   // 4kb page
     return 1;
 }
 
-/* translate and read  virtual address  */
+// ---- read a virtual address by walking page tables ----
 static int vread(u64 cr3, u64 va, void *buf, u32 sz) {
     u8 *dst = (u8*)buf;
     while (sz) {
@@ -232,7 +178,7 @@ static int vread(u64 cr3, u64 va, void *buf, u32 sz) {
     return 1;
 }
 
-/* translate and write virtual address */
+// ---- write a virtual address by walking page tables ----
 static int vwrite(u64 cr3, u64 va, const void *buf, u32 sz) {
     const u8 *src = (const u8*)buf;
     while (sz) {
@@ -248,10 +194,8 @@ static int vwrite(u64 cr3, u64 va, const void *buf, u32 sz) {
     return 1;
 }
 
-/* ================================================================== */
-/*  locate PTE physical address for a given VA                        */
-/* ================================================================== */
-
+// ---- walk page tables to find the PTE physical address for a given VA ----
+// we need this to flip the NX bit on the stack page so we can execute shellcode there
 static int vtop_pte(u64 cr3, u64 va, u64 *pte_pa) {
     u64 idx[4] = {
         (va >> 39) & 0x1FF,
@@ -265,20 +209,18 @@ static int vtop_pte(u64 cr3, u64 va, u64 *pte_pa) {
         u64 ent = 0;
         if (!phys_read(ent_pa, &ent, 8)) return 0;
         if (!(ent & 1)) return 0;
-        if (lv >= 1 && (ent & 0x80)) {
+        if (lv >= 1 && (ent & 0x80)) {   // large page, the pde/pte IS the entry we just read
             *pte_pa = ent_pa;
             return 1;
         }
         tbl = ent & ~0xFFFULL;
     }
-    *pte_pa = tbl + idx[3] * 8;
+    *pte_pa = tbl + idx[3] * 8;   // 4kb page pte
     return 1;
 }
 
-/* ================================================================== */
-/*  resolve kernel export by walking ntoskrnl PE                      */
-/* ================================================================== */
-
+// ---- resolve a kernel export by walking ntoskrnl's PE headers ----
+// we use this to find PsInitialSystemProcess so we can walk the eprocess linked list
 static u64 kexport(u64 cr3, u64 kva, const char *name) {
     IMAGE_DOS_HEADER       dos;
     IMAGE_NT_HEADERS64     nth;
@@ -312,10 +254,7 @@ static u64 kexport(u64 cr3, u64 kva, const char *name) {
     return 0;
 }
 
-/* ================================================================== */
-/*  windows build detection + offset table lookup                     */
-/* ================================================================== */
-
+// ---- get the windows build number so we know which eprocess offsets to use ----
 static u32 winbuild(void) {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     if (!ntdll) return 0;
@@ -327,17 +266,15 @@ static u32 winbuild(void) {
     return v.dwBuildNumber;
 }
 
-/* ================================================================== */
-/*  get directory-table-base (CR3) for a given PID via syscall        */
-/*  tries SystemExtendedProcessInformation classes, scans for CR3     */
-/* ================================================================== */
-
+// ---- get the directory table base (cr3) for any process by pid ----
+// uses SystemExtendedProcessInformation from ntdll, which returns the cr3 per-process
+// the cr3 offset inside the struct varies across builds so we scan for it heuristically
 static u64 get_dirbase(u32 pid) {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     NtQSI_t qsi = (NtQSI_t)GetProcAddress(ntdll, "NtQuerySystemInformation");
     if (!qsi) return 0;
 
-    /* try several known extended-process-information classes */
+    // try a few known system information class ids for extended process info
     u32 classes[] = { 0x39, 0x3D, 0x3E, 0 };
     u8  *buf = 0;
     u32  need = 0;
@@ -357,12 +294,11 @@ static u64 get_dirbase(u32 pid) {
     u8 *cur = buf;
     for (;;) {
         u32 next = *(u32*)(cur + 0);
-        /* UniqueProcessId is always at offset 0x50 in the standard header */
+        // pid is at offset 0x50 in the standard process info header
         void *epid = *(void**)(cur + 0x50);
         if ((u32)(u64)epid == pid) {
-            /* scan forward for a page-aligned ULONG64 (DirectoryTableBase).
-             * CR3's PML4 physical address is always 4K-aligned (low 12 bits=0)
-             * and falls within a plausible physical-address range. */
+            // directory table base is always page-aligned and in a sane physical range
+            // scan forward from the pid until we hit one that looks like a valid cr3
             for (u32 off = 0x50; off + 8 <= 0x200; off += 8) {
                 u64 v = *(u64*)(cur + off);
                 if (v && (v & 0xFFF) == 0 && v >= 0x1000 && v < 0x10000000000ULL) {
@@ -379,18 +315,14 @@ static u64 get_dirbase(u32 pid) {
     return cr3;
 }
 
-/* ================================================================== */
-/*  driver discovery                                                   */
-/* ================================================================== */
-
-static char g_drv_name[MAX_PATH] = {0};
-
+// ---- probe a single driver device to see if it gives us physical r/w ----
+// opens the device, sends a test read ioctl, closes it
 static BOOL driver_probe(const char *name) {
     HANDLE h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE,
                            0, 0, OPEN_EXISTING, 0, 0);
     if (h == INVALID_HANDLE_VALUE) return 0;
 
-    /* try reading physical address 0x1000 -- readable on any x86 system */
+    // physical address 0x1000 is always mapped on x86, try reading 8 bytes from it
     u64 v = 0;
     ioctl_req_t r = { 0x1000, (u64)&v, 8 };
     u32 rb = 0;
@@ -401,10 +333,14 @@ static BOOL driver_probe(const char *name) {
     return ok;
 }
 
+static char g_drv_name[MAX_PATH] = {0};
+
+// ---- find and open a vulnerable driver ----
+// first checks our known list, then falls back to enumerating all kernel services
 static BOOL driver_acquire(void) {
     int found = 0;
 
-    /* 1. known candidates */
+    // try all the known device names we hardcoded
     for (int i = 0; g_vuln_drivers[i]; i++) {
         if (driver_probe(g_vuln_drivers[i])) {
             strncpy(g_drv_name, g_vuln_drivers[i], MAX_PATH - 1);
@@ -414,7 +350,7 @@ static BOOL driver_acquire(void) {
         }
     }
 
-    /* 2. enumerate loaded kernel-driver services */
+    // if none of the known names worked, walk the service manager looking for drivers
     if (!found) {
         SC_HANDLE scm = OpenSCManagerA(0, 0, SC_MANAGER_ENUMERATE_SERVICE);
         if (scm) {
@@ -443,11 +379,11 @@ static BOOL driver_acquire(void) {
 
     if (!found) {
         printf(" [-] no vulnerable driver found\n");
-        printf(" [*] install: MSI Afterburner, Intel XTU, or ASUS GPU Tweak II\n");
+        printf(" [*] install MSI Afterburner, Intel XTU, or ASUS GPU Tweak II\n");
         return 0;
     }
 
-    /* open the driver for real */
+    // open the working driver with full r/w for actual use
     g_dev = CreateFileA(g_drv_name,
         GENERIC_READ | GENERIC_WRITE, 0, 0,
         OPEN_EXISTING, 0, 0);
@@ -460,51 +396,51 @@ static BOOL driver_acquire(void) {
     return 1;
 }
 
-/* ================================================================== */
-/*  bootstrap: get a working CR3 for kernel-va -> pa translation      */
-/*  uses our own process CR3 (works because kernel half is shared)    */
-/* ================================================================== */
-
+// ---- bootstrap: resolve kernel base, get a cr3, figure out offsets ----
+// this runs once at startup and fills in all the globals
 static int bootstrap(void) {
-    /* resolve ntoskrnl base (virtual address) */
+    // get ntoskrnl base address from the system module list
     {
         NtQSI_t qsi = (NtQSI_t)GetProcAddress(
             GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation");
         if (!qsi) { printf(" [-] NtQuerySystemInformation missing\n"); return 0; }
 
         u32 need = 0;
-        qsi(0x0B, 0, 0, &need);
+        qsi(0x0B, 0, 0, &need);   // SystemModuleInformation
         void *buf = VirtualAlloc(0, need, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!buf || !NT_SUCCESS(qsi(0x0B, buf, need, 0))) {
             VirtualFree(buf, 0, MEM_RELEASE);
             printf(" [-] SystemModuleInformation failed\n");
             return 0;
         }
-        /* first entry = ntoskrnl */
-        g_ntos_va = *(u64*)((u8*)buf + 8 + 8); /* offset: u32 count, u32 pad, then base */
+        // the structure is: u32 count, u32 pad, then module entries
+        // each entry: u32 unknown1, u32 unknown2, PVOID base, ...
+        // so first module base is at buf + 8 + 8 = buf + 16
+        g_ntos_va = *(u64*)((u8*)buf + 16);
         VirtualFree(buf, 0, MEM_RELEASE);
     }
 
     if (!g_ntos_va) {
-        printf(" [-] ntoskrnl base not resolved\n");
+        printf(" [-] could not resolve ntoskrnl base\n");
         return 0;
     }
     printf(" [+] ntoskrnl: 0x%llX\n", g_ntos_va);
 
-    /* get our own process CR3 for kernel-address translation */
+    // get our own process cr3 - we need this to translate kernel virtual addresses
+    // kernel page tables are shared, so any process cr3 works for kernel va->pa
     g_cr3 = get_dirbase(GetCurrentProcessId());
     if (!g_cr3) {
-        printf(" [-] cannot get own CR3\n");
+        printf(" [-] could not get our own CR3\n");
         return 0;
     }
 
-    /* translate ntoskrnl VA -> PA so kexport() works */
+    // translate ntoskrnl from virtual to physical so kexport() can walk its PE
     if (!vtop(g_cr3, g_ntos_va, &g_ntos)) {
-        printf(" [-] ntoskrnl VA->PA translation failed\n");
+        printf(" [-] ntoskrnl va->pa translation failed\n");
         return 0;
     }
 
-    /* resolve windows build + eprocess offsets */
+    // figure out which eprocess offset table to use based on windows build
     {
         u32 b = winbuild();
         printf(" [*] windows build: %u\n", b);
@@ -515,7 +451,7 @@ static int bootstrap(void) {
             }
         }
         if (!g_off.off_pid) {
-            printf(" [!] unknown build, using defaults\n");
+            printf(" [!] unknown build, using win10 1803+ defaults\n");
             g_off.off_pid     = 0x440;
             g_off.off_links   = 0x448;
             g_off.off_dirbase = 0x28;
@@ -525,10 +461,8 @@ static int bootstrap(void) {
     return 1;
 }
 
-/* ================================================================== */
-/*  find eprocess for target pid  (uses kernel export + cr3)          */
-/* ================================================================== */
-
+// ---- walk the eprocess linked list from PsInitialSystemProcess to find our target ----
+// returns the eprocess address and fills in the target's cr3
 static u64 find_eprocess(u32 pid, u64 *cr3_out) {
     u64 psinit = kexport(g_cr3, g_ntos_va, "PsInitialSystemProcess");
     if (!psinit) {
@@ -552,64 +486,62 @@ static u64 find_eprocess(u32 pid, u64 *cr3_out) {
             return cur;
         }
 
+        // follow flink to next eprocess
         u64 links = 0;
         if (!vread(g_cr3, cur + g_off.off_links, &links, 8)) break;
         cur = links - g_off.off_links;
-        if (cur == start) break;
+        if (cur == start) break;   // full loop, target not found
     }
 
     return 0;
 }
 
-/* ================================================================== */
-/*  shellcode template -- calls LoadLibraryA(path) and returns        */
-/* ================================================================== */
-
+// ---- build the x64 shellcode that calls LoadLibraryA and returns cleanly ----
+// layout: [machine code 0x30 bytes] [LoadLibraryA ptr 8 bytes] [dll path string]
+// the code saves volatile regs, calls LoadLibraryA, restores regs, rets
+// rip-relative addressing is used so it works anywhere we drop it
 static u32 build_sc(u8 *out, u32  max, u64 ll, const char *dll) {
     u32 plen = (u32)strlen(dll) + 1;
-    u32 csz  = 0x30;                       /* code size               */
-    u32 tsz  = csz + 8 + plen;             /* total shellcode size    */
+    u32 csz  = 0x30;                     // code section size
+    u32 tsz  = csz + 8 + plen;           // total shellcode size
     if (tsz > max) return 0;
 
-    /* RIP-relative offsets from the LEA / MOV instructions */
-    i32 doff = (i32)(csz + 8  - (0x0F + 7));  /* -> dll string    */
-    i32 loff = (i32)(csz      - (0x16 + 7));  /* -> LoadLibraryA  */
+    // rip-relative offsets from the lea/mov instructions to the data section
+    i32 doff = (i32)(csz + 8  - (0x0F + 7));   // lea rcx, [rip + X] -> dll string
+    i32 loff = (i32)(csz      - (0x16 + 7));   // mov rax, [rip + X] -> LoadLibraryA ptr
 
     u8 code[] = {
-        0x50,                           /* push rax              */
-        0x51,                           /* push rcx              */
-        0x52,                           /* push rdx              */
-        0x41,0x50,                      /* push r8               */
-        0x41,0x51,                      /* push r9               */
-        0x41,0x52,                      /* push r10              */
-        0x41,0x53,                      /* push r11              */
-        0x48,0x83,0xEC,0x28,           /* sub  rsp, 0x28        */
-        0x48,0x8D,0x0D,
+        0x50,                           // push rax
+        0x51,                           // push rcx
+        0x52,                           // push rdx
+        0x41,0x50,                      // push r8
+        0x41,0x51,                      // push r9
+        0x41,0x52,                      // push r10
+        0x41,0x53,                      // push r11
+        0x48,0x83,0xEC,0x28,           // sub  rsp, 0x28
+        0x48,0x8D,0x0D,                // lea  rcx, [rip + doff]
             (u8)doff,(u8)(doff>>8),(u8)(doff>>16),(u8)(doff>>24),
-        0x48,0x8B,0x05,
+        0x48,0x8B,0x05,                // mov  rax, [rip + loff]
             (u8)loff,(u8)(loff>>8),(u8)(loff>>16),(u8)(loff>>24),
-        0xFF,0xD0,                      /* call rax              */
-        0x48,0x83,0xC4,0x28,           /* add  rsp, 0x28        */
-        0x41,0x5B,                      /* pop  r11              */
-        0x41,0x5A,                      /* pop  r10              */
-        0x41,0x59,                      /* pop  r9               */
-        0x41,0x58,                      /* pop  r8               */
-        0x5A,                           /* pop  rdx              */
-        0x59,                           /* pop  rcx              */
-        0x58,                           /* pop  rax              */
-        0xC3                            /* ret                   */
+        0xFF,0xD0,                      // call rax
+        0x48,0x83,0xC4,0x28,           // add  rsp, 0x28
+        0x41,0x5B,                      // pop  r11
+        0x41,0x5A,                      // pop  r10
+        0x41,0x59,                      // pop  r9
+        0x41,0x58,                      // pop  r8
+        0x5A,                           // pop  rdx
+        0x59,                           // pop  rcx
+        0x58,                           // pop  rax
+        0xC3                            // ret
     };
 
     memcpy(out, code, sizeof(code));
-    memcpy(out + 0x30, &ll,   8);
-    memcpy(out + 0x38, dll, plen);
+    memcpy(out + 0x30, &ll,   8);       // embed loadlibrary address
+    memcpy(out + 0x38, dll, plen);      // embed dll path string
     return tsz;
 }
 
-/* ================================================================== */
-/*  find a suspendable thread in the target process                   */
-/* ================================================================== */
-
+// ---- grab any thread from the target process that we can suspend and hijack ----
 static HANDLE grab_thread(u32 pid) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
@@ -629,20 +561,25 @@ static HANDLE grab_thread(u32 pid) {
     return h;
 }
 
-/* ================================================================== */
-/*  inject                                                             */
-/* ================================================================== */
-
+// ---- the main injection routine ----
+// 1. find target eprocess and get its cr3
+// 2. grab a thread and suspend it
+// 3. write shellcode to the thread's stack page
+// 4. flip nx bit off on that page so we can execute there
+// 5. push original rip onto the stack, set rip to our shellcode
+// 6. resume the thread -> shellcode runs, calls LoadLibraryA, returns normally
+// 7. restore the nx bit after the shellcode had time to run
 static int inject(u32 pid, const char *dll) {
     u64 cr3 = 0;
     u64 ep  = find_eprocess(pid, &cr3);
     if (!ep || !cr3) {
-        printf(" [-] target eprocess not found\n");
+        printf(" [-] could not find target eprocess\n");
         return 0;
     }
     printf(" [+] target cr3: 0x%llX\n", cr3);
 
-    /* resolve LoadLibraryA */
+    // resolve LoadLibraryA address in our own process
+    // kernel32 is at the same base in target process since session-wide aslr
     u64 ll = (u64)GetProcAddress(GetModuleHandleA("kernel32.dll"),
                                  "LoadLibraryA");
     if (!ll) {
@@ -650,10 +587,9 @@ static int inject(u32 pid, const char *dll) {
         return 0;
     }
 
-    /* open a thread */
     HANDLE th = grab_thread(pid);
     if (!th) {
-        printf(" [-] no target thread available\n");
+        printf(" [-] no target thread to hijack\n");
         return 0;
     }
 
@@ -672,11 +608,13 @@ static int inject(u32 pid, const char *dll) {
         return 0;
     }
 
-    /* ---- write shellcode to thread's stack page ---- */
-    u64 stk_pg   = ctx.Rsp & ~0xFFFULL;
-    u64 sc_va    = stk_pg;          /* page start (well below RSP) */
+    // use the bottom of the thread's stack page for shellcode
+    // the thread is suspended so its active stack data is near rsp,
+    // writing at page start is safe
+    u64 stk_pg = ctx.Rsp & ~0xFFFULL;
+    u64 sc_va  = stk_pg;
 
-    /* find PTE for the stack page */
+    // find the pte for the stack page so we can toggle nx
     u64 pte = 0;
     if (!vtop_pte(cr3, stk_pg, &pte)) {
         printf(" [-] vtop_pte failed\n");
@@ -689,29 +627,32 @@ static int inject(u32 pid, const char *dll) {
         goto fail;
     }
 
+    // make sure the page exists and is writable before we write to it
     if (!(orig_pte & 1) || !(orig_pte & 2)) {
-        printf(" [-] stack page invalid (PTE=0x%llX)\n", orig_pte);
+        printf(" [-] stack page not mapped (PTE=0x%llX)\n", orig_pte);
         goto fail;
     }
 
-    /* clear NX bit (bit 63) to allow execution */
+    // clear the no-execute bit (bit 63 in the pte)
+    // this makes the stack page executable so our shellcode can run there
     u64 new_pte = orig_pte & ~(1ULL << 63);
     if (!phys_write(pte, &new_pte, 8)) {
-        printf(" [-] write PTE failed\n");
+        printf(" [-] PTE write failed\n");
         goto fail;
     }
 
-    /* build & write shellcode */
+    // build the shellcode with the dll path baked in
     u8 sc[512] = {0};
     u32 scsz = build_sc(sc, sizeof(sc), ll, dll);
-    if (!scsz) { printf(" [-] shellcode too large\n"); goto fail_pte; }
+    if (!scsz) { printf(" [-] shellcode too big\n"); goto fail_pte; }
 
+    // write shellcode into the target process via physical memory
     if (!vwrite(cr3, sc_va, sc, scsz)) {
-        printf(" [-] write shellcode failed\n");
+        printf(" [-] shellcode write failed\n");
         goto fail_pte;
     }
 
-    /* verify */
+    // double check the shellcode landed correctly
     {
         u8 vfy[64];
         if (!vread(cr3, sc_va, vfy, 64) || memcmp(vfy, sc, 64)) {
@@ -720,7 +661,8 @@ static int inject(u32 pid, const char *dll) {
         }
     }
 
-    /* push original RIP onto the thread's stack for clean return */
+    // push the original rip onto the thread's stack
+    // when the shellcode hits "ret" it'll pop this and jump back where it was
     u64 orig_rip = ctx.Rip;
     ctx.Rsp -= 8;
     if (!vwrite(cr3, ctx.Rsp, &orig_rip, 8)) {
@@ -728,7 +670,7 @@ static int inject(u32 pid, const char *dll) {
         goto fail_pte;
     }
 
-    /* redirect execution to shellcode */
+    // redirect the thread to our shellcode
     ctx.Rip = sc_va;
 
     if (!SetThreadContext(th, &ctx)) {
@@ -739,10 +681,10 @@ static int inject(u32 pid, const char *dll) {
 
     printf(" [*] hijack: RIP 0x%llX -> 0x%llX\n", orig_rip, sc_va);
 
-    /* run it */
+    // let it rip
     ResumeThread(th);
 
-    /* allow shellcode to execute, then restore NX */
+    // give the shellcode time to run, then put the nx bit back
     Sleep(800);
     phys_write(pte, &orig_pte, 8);
 
@@ -758,10 +700,7 @@ fail:
     return 0;
 }
 
-/* ================================================================== */
-/*  process lookup                                                     */
-/* ================================================================== */
-
+// ---- find a process by name, returns pid or 0 ----
 static u32 find_pid(const char *name) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
@@ -776,27 +715,19 @@ static u32 find_pid(const char *name) {
     return pid;
 }
 
-/* ================================================================== */
-/*  usage                                                              */
-/* ================================================================== */
-
 static void usage(const char *me) {
     printf(
         "\n"
-        "  kinject  --  kernel-level DLL injector for Roblox (BYOVD)\n\n"
+        "  kinject  --  kernel-level injector for roblox\n\n"
         "  usage:\n"
-        "    %s                                    inject Module.dll into Roblox\n"
-        "    %s <dll>                              inject a specific DLL\n"
+        "    %s                                    inject Module.dll into roblox\n"
+        "    %s <dll>                              inject a specific dll\n"
         "    %s -n <name> <dll>                    inject by process name\n"
-        "    %s -p <pid>  <dll>                    inject by PID\n\n"
-        "  default payload: Module.dll  (rename your DLL to Module.dll)\n"
-        "  requires: Administrator + vulnerable signed driver\n\n",
+        "    %s -p <pid>  <dll>                    inject by pid\n\n"
+        "  default payload: Module.dll (rename your dll to Module.dll)\n"
+        "  run as admin, needs a vulnerable driver loaded\n\n",
         me, me, me, me);
 }
-
-/* ================================================================== */
-/*  entry                                                              */
-/* ================================================================== */
 
 int main(int argc, char **argv) {
     const char *target = "RobloxPlayerBeta.exe";
@@ -822,29 +753,29 @@ int main(int argc, char **argv) {
     }
 
     if (!dll) {
-        /* default: Module.dll in the current directory */
+        // no dll given, we look for Module.dll next to the exe
         GetFullPathNameA("Module.dll", MAX_PATH, def, 0);
         dll = def;
         printf(" [*] payload: %s\n", dll);
     }
 
-    /* --- bootstrap: get ntos base + our own cr3 --- */
+    // step 1: get ntos base, resolve our own cr3, figure out offsets
     printf("\n  -- kinject --\n\n");
     if (!bootstrap()) return 1;
 
-    /* --- find target --- */
+    // step 2: find roblox
     if (!pid) {
         pid = find_pid(target);
-        if (!pid) { printf(" [-] %s not running\n", target); return 1; }
+        if (!pid) { printf(" [-] %s is not running\n", target); return 1; }
     }
     printf(" [+] target: %s  (pid %u)\n", target, pid);
     printf(" [*] payload: %s\n", dll);
 
-    /* --- acquire vulnerable driver --- */
+    // step 3: find a vulnerable driver to use
     printf(" [*] searching for vulnerable driver...\n");
     if (!driver_acquire()) return 1;
 
-    /* --- inject --- */
+    // step 4: inject
     if (!inject(pid, dll)) {
         printf(" [-] injection failed\n");
         return 1;
